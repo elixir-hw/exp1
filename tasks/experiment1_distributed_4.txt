@@ -1,0 +1,5 @@
+# Four tasks for distributed Experiment 1
+place_fan
+place_a2b_right
+place_mouse_pad
+place_dual_shoes

@@ -130,6 +130,8 @@ def validate(config: dict[str, Any]) -> None:
             errors.append("persistent_server requires workers_per_gpu=1 to isolate RESET sessions")
         if len(set(parallel_gpus)) != len(parallel_gpus):
             errors.append("persistent_server requires distinct parallel_gpus")
+        if int(config["hardware"].get("persistent_servers_per_gpu", 1)) < 1:
+            errors.append("persistent_servers_per_gpu must be positive")
 
     if errors:
         raise ValueError("Invalid Experiment 1 configuration:\n- " + "\n- ".join(errors))
@@ -666,6 +668,8 @@ def run_persistent_methods(
 ) -> None:
     """Keep one server per GPU and method; give it exclusive rollout sessions."""
     gpus = [int(gpu) for gpu in config["hardware"]["parallel_gpus"]]
+    servers_per_gpu = int(config["hardware"].get("persistent_servers_per_gpu", 1))
+    slots = [(gpu, slot) for gpu in gpus for slot in range(servers_per_gpu)]
     manifest_root = Path(config["paths"]["state_manifest_root"])
     openwam_repo = Path(config["paths"]["openwam_repo"])
     host = str(config["hardware"]["openwam_host"])
@@ -691,18 +695,19 @@ def run_persistent_methods(
         print(f"[experiment1] {method}: pending rollouts {len(pending)}/{len(jobs)}", flush=True)
         if not pending:
             continue
-        assignments = {gpu: [] for gpu in gpus}
+        assignments = {slot: [] for slot in slots}
         for index, job in pending:
-            assignments[gpus[index % len(gpus)]].append(job)
+            assignments[slots[index % len(slots)]].append(job)
 
-        def gpu_worker(gpu: int, gpu_jobs: list[tuple[str, int, int]]) -> list[tuple[str, str, int, int, str]]:
+        def gpu_worker(gpu: int, slot: int, gpu_jobs: list[tuple[str, int, int]]) -> list[tuple[str, str, int, int, str]]:
             worker_config = deepcopy(config)
-            port = choose_available_port(host, base_port, gpu)
+            port = choose_available_port(host, base_port, gpu * servers_per_gpu + slot)
             worker_config["hardware"].update(
                 openwam_model_gpu=gpu, openwam_sim_gpu=gpu, openwam_port=port,
             )
             model = worker_config["models"]["openwam"][method]
-            worker_dir = run_root / "openwam" / method / "workers" / f"gpu_{gpu}"
+            worker_name = f"gpu_{gpu}" if servers_per_gpu == 1 else f"gpu_{gpu}_slot_{slot}"
+            worker_dir = run_root / "openwam" / method / "workers" / worker_name
             worker_dir.mkdir(parents=True, exist_ok=True)
             process = log = None
             restarts = 0
@@ -721,7 +726,8 @@ def run_persistent_methods(
                                 worker_config, method, model, run_root, dry_run, server_dir=server_dir,
                             )
                             write_json(server_dir / "timing.json", {
-                                "gpu": gpu, "method": method, "ready_sec": round(time.monotonic() - ready_start, 3),
+                                "gpu": gpu, "slot": slot, "method": method,
+                                "ready_sec": round(time.monotonic() - ready_start, 3),
                                 "restart": restarts,
                             })
                         except Exception as exc:
@@ -758,14 +764,15 @@ def run_persistent_methods(
             finally:
                 stop_server(process, log)
                 write_json(worker_dir / "worker_timing.json", {
-                    "gpu": gpu, "method": method, "jobs": len(gpu_jobs), "restarts": restarts,
+                    "gpu": gpu, "slot": slot, "method": method,
+                    "jobs": len(gpu_jobs), "restarts": restarts,
                     "wall_sec": round(time.monotonic() - started, 3),
                 })
             return worker_errors
 
-        with ThreadPoolExecutor(max_workers=len(gpus)) as executor:
-            futures = {executor.submit(gpu_worker, gpu, assigned): gpu
-                       for gpu, assigned in assignments.items() if assigned}
+        with ThreadPoolExecutor(max_workers=len(slots)) as executor:
+            futures = {executor.submit(gpu_worker, gpu, slot, assigned): (gpu, slot)
+                       for (gpu, slot), assigned in assignments.items() if assigned}
             for future in as_completed(futures):
                 failures.extend(future.result())
     if failures:
@@ -1041,6 +1048,11 @@ def main() -> None:
     parser.add_argument("--state-limit", type=int)
     parser.add_argument("--rollouts-per-state", type=int)
     parser.add_argument("--max-action-steps", type=int)
+    parser.add_argument("--rollout-start", type=int)
+    parser.add_argument("--rollout-end", type=int)
+    parser.add_argument("--skip-text-cache", action="store_true")
+    parser.add_argument("--parallel-gpus", help="Comma-separated GPU indices for this host")
+    parser.add_argument("--persistent-servers-per-gpu", type=int)
     parser.add_argument("--force-manifests", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -1055,6 +1067,13 @@ def main() -> None:
 
     config_path = args.config.resolve()
     config = resolve_config_paths(load_json(config_path), config_path)
+    if args.parallel_gpus:
+        try:
+            config["hardware"]["parallel_gpus"] = [int(item) for item in args.parallel_gpus.split(",")]
+        except ValueError:
+            parser.error("--parallel-gpus must be comma-separated integers")
+    if args.persistent_servers_per_gpu is not None:
+        config["hardware"]["persistent_servers_per_gpu"] = args.persistent_servers_per_gpu
     validate(config)
     print("[experiment1] configuration is valid")
     if args.command == "validate":
@@ -1066,6 +1085,14 @@ def main() -> None:
     tasks = selected_tasks(config, args.task_limit)
     states_per_task = args.state_limit or int(config["protocol"]["states_per_task"])
     rollouts_per_state = args.rollouts_per_state or int(config["protocol"]["rollouts_per_state"])
+    partial = args.rollout_start is not None or args.rollout_end is not None
+    if partial:
+        start = 0 if args.rollout_start is None else args.rollout_start
+        end = rollouts_per_state if args.rollout_end is None else args.rollout_end
+        if not (0 <= start < end <= rollouts_per_state):
+            parser.error("rollout range must satisfy 0 <= start < end <= rollouts_per_state")
+        if not config["hardware"].get("persistent_server"):
+            parser.error("rollout ranges require persistent_server=true")
     config["paths"]["state_manifest_root"] = str(Path(config["paths"]["state_manifest_root"]).resolve())
     metadata = {
             "created_at": datetime.now().astimezone().isoformat(),
@@ -1107,11 +1134,10 @@ def main() -> None:
         return
 
     methods = list(config["models"]["openwam"]) if args.method == "all" else [args.method]
-    prepare_text_cache(config, run_root, tasks=tasks, methods=methods, dry_run=args.dry_run)
+    if not args.skip_text_cache:
+        prepare_text_cache(config, run_root, tasks=tasks, methods=methods, dry_run=args.dry_run)
     runner = run_parallel_methods if config["hardware"].get("parallel_gpus") else run_methods
-    runner(
-        config,
-        run_root,
+    runner_args = dict(
         tasks=tasks,
         methods=methods,
         states_per_task=states_per_task,
@@ -1119,7 +1145,14 @@ def main() -> None:
         max_action_steps=args.max_action_steps,
         dry_run=args.dry_run,
     )
-    if not args.dry_run:
+    if partial:
+        runner_args["only_jobs"] = {
+            (method, task, state_id, rollout_id)
+            for task in tasks for state_id in range(states_per_task)
+            for method in methods for rollout_id in range(start, end)
+        }
+    runner(config, run_root, **runner_args)
+    if not args.dry_run and not partial:
         summarize(run_root)
     print(f"[experiment1] run directory: {run_root}", flush=True)
 

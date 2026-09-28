@@ -1,0 +1,65 @@
+{
+  "label": "experiment1-distributed-four-task-20x32",
+  "smoke_only": false,
+  "paths": {
+    "openwam_repo": "/home/chw/code/packages/OpenWAM/OpenWAM",
+    "robotwin_repo": "/home/chw/code/packages/RoboTwin/XPolicyLab/policy/FastWAM/FastWAM/third_party/RoboTwin",
+    "robotwin_python": "/home/chw/miniconda3/envs/RoboTwin/bin/python",
+    "robotwin_task_config_dir": "/home/chw/code/packages/RoboTwin/env_cfg/task_config",
+    "robotwin_assets_dir": "/home/chw/code/packages/RoboTwin/RoboTwin/assets",
+    "state_manifest_root": "manifests/experiment1_distributed_4_20_states",
+    "task_file": "tasks/experiment1_distributed_4.txt"
+  },
+  "protocol": {
+    "mode": "demo_clean",
+    "states_per_task": 20,
+    "rollouts_per_state": 32,
+    "seed": 0,
+    "instruction_type": "unseen",
+    "checkpoint_name": "checkpoint_step_50000.safetensors",
+    "skip_get_obs_within_replan": false,
+    "max_manifest_attempts": 1000,
+    "max_consecutive_infra_errors": 3
+  },
+  "runtimes": {
+    "openwam": {
+      "command": [
+        "/home/chw/miniconda3/envs/openwam/bin/python"
+      ]
+    }
+  },
+  "hardware": {
+    "openwam_model_gpu": 0,
+    "openwam_sim_gpu": 1,
+    "text_cache_gpu": 2,
+    "parallel_gpus": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "workers_per_gpu": 1,
+    "parallel_by_rollout": true,
+    "openwam_host": "127.0.0.1",
+    "openwam_port": 8848,
+    "persistent_server": true
+  },
+  "models": {
+    "openwam": {
+      "no_wm": {
+        "checkpoint_dir": "/mnt/data/chw/model/openwam_train_runs/robotwin_clean40_action_only_no_wm_50k_8gpu_bs2_acc2_gbs32_20260926_055033/2026-09-26_05-51-27",
+        "deploy_args": [
+          "--compile-enabled",
+          "false"
+        ]
+      },
+      "wm": {
+        "checkpoint_dir": "/mnt/data/chw/model/openwam_train_runs/robotwin_clean40_wm_full_50k_8gpu_bs2_acc2_gbs32_20260926_055033/2026-09-26_05-51-23",
+        "deploy_args": [
+          "--compile-enabled",
+          "false"
+        ]
+      }
+    }
+  }
+}

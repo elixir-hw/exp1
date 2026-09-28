@@ -86,6 +86,22 @@ class PersistentSchedulerTest(unittest.TestCase):
                                               "place_fan" / "state_000" / "result.json")
                 self.assertEqual([row["rollout_id"] for row in merged["rollouts"]], list(range(4)))
 
+            config["hardware"]["parallel_gpus"] = [0]
+            config["hardware"]["persistent_servers_per_gpu"] = 2
+            dual_root = root / "two_slots"
+            with patch.object(experiment, "start_server", side_effect=start_server), \
+                 patch.object(experiment, "stop_server"), \
+                 patch.object(experiment, "run_logged", side_effect=run_logged), \
+                 patch.object(experiment, "make_env", return_value={}):
+                experiment.run_persistent_methods(
+                    config, dual_root, tasks=["place_fan"], methods=["no_wm"],
+                    states_per_task=1, rollouts_per_state=4,
+                    max_action_steps=None, dry_run=False,
+                )
+            self.assertTrue((dual_root / "openwam/no_wm/workers/gpu_0_slot_0/timing.json").is_file())
+            self.assertTrue((dual_root / "openwam/no_wm/workers/gpu_0_slot_1/timing.json").is_file())
+            self.assertEqual(len(starts), 7)
+
 
 if __name__ == "__main__":
     unittest.main()
