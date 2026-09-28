@@ -17,6 +17,7 @@ import importlib.util
 import json
 import os
 import sys
+import tempfile
 import time
 import traceback
 from pathlib import Path
@@ -33,7 +34,14 @@ def load_json(path: Path) -> dict[str, Any]:
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+        tmp_path = Path(handle.name)
+        try:
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+    tmp_path.replace(path)
 
 
 def load_module_from_path(name: str, path: Path):
@@ -366,7 +374,7 @@ def run_one_rollout(
     max_action_steps: int | None,
 ) -> dict[str, Any]:
     np.random.seed(policy_seed % (2**32 - 1))
-    started_at = time.time()
+    started_at = time.monotonic()
     result: dict[str, Any] = {
         "rollout_id": rollout_id,
         "policy_seed": policy_seed,
@@ -375,8 +383,11 @@ def run_one_rollout(
         "truncated": False,
         "error": None,
         "elapsed_sec": None,
+        "timing": {"setup_sec": 0.0, "get_obs_sec": 0.0, "eval_sec": 0.0,
+                   "teardown_sec": 0.0, "obs_count": 0, "action_steps": 0},
     }
     try:
+        phase_start = time.monotonic()
         reset_func(model)
         if hasattr(model, "set_sampling_seed"):
             model.set_sampling_seed(policy_seed)
@@ -387,17 +398,24 @@ def run_one_rollout(
             **env_args,
         )
         task_env.set_instruction(instruction=str(state["instruction"]))
+        result["timing"]["setup_sec"] = round(time.monotonic() - phase_start, 3)
         action_limit = min(task_env.step_lim, max_action_steps) if max_action_steps else task_env.step_lim
         while task_env.take_action_cnt < action_limit:
             need_obs = True
             if skip_get_obs_within_replan and hasattr(model, "should_request_observation"):
                 need_obs = bool(model.should_request_observation())
+            phase_start = time.monotonic()
             observation = task_env.get_obs() if need_obs else None
+            result["timing"]["get_obs_sec"] += time.monotonic() - phase_start
+            result["timing"]["obs_count"] += int(need_obs)
+            phase_start = time.monotonic()
             eval_func(task_env, model, observation)
+            result["timing"]["eval_sec"] += time.monotonic() - phase_start
             if task_env.eval_success:
                 result["success"] = True
                 break
         result["terminal_step"] = int(getattr(task_env, "take_action_cnt", -1))
+        result["timing"]["action_steps"] = result["terminal_step"]
         result["truncated"] = bool(
             max_action_steps and not result["success"] and task_env.take_action_cnt < task_env.step_lim
         )
@@ -405,8 +423,12 @@ def run_one_rollout(
         result["error"] = f"{type(exc).__name__}: {exc}"
         traceback.print_exc()
     finally:
-        result["elapsed_sec"] = round(time.time() - started_at, 3)
+        phase_start = time.monotonic()
         safe_close(task_env)
+        result["timing"]["teardown_sec"] = round(time.monotonic() - phase_start, 3)
+        for key in ("get_obs_sec", "eval_sec"):
+            result["timing"][key] = round(result["timing"][key], 3)
+        result["elapsed_sec"] = round(time.monotonic() - started_at, 3)
     return result
 
 

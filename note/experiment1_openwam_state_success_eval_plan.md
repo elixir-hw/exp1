@@ -1,5 +1,13 @@
 # Experiment 1: OpenWAM fixed-state success probability evaluation plan
 
+> 2026-09-28 protocol update: the formal run uses **10 fixed states per task and
+> 128 rollouts per state per model**. With 10 final tasks, that is
+> `10 * 10 * 128 * 2 = 25,600` rollouts, or 2,560 per task. Earlier `20 * 32`
+> counts and examples below document the original draft and are superseded by
+> this update. The final task list is still pending; the five selected tasks
+> are for acceleration tests only. Use `config.experiment1.template.json` as
+> the current formal template after filling its placeholder paths and task file.
+
 ## 0. Scope
 
 This document describes how to evaluate Experiment 1 in

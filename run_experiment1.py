@@ -123,6 +123,13 @@ def validate(config: dict[str, Any]) -> None:
         errors.append(f"hardware.parallel_gpus must use only GPU 0-3, got {parallel_gpus}")
     if int(config["hardware"].get("workers_per_gpu", 1)) < 1:
         errors.append("hardware.workers_per_gpu must be positive")
+    if config["hardware"].get("persistent_server"):
+        if not parallel_gpus or not config["hardware"].get("parallel_by_rollout"):
+            errors.append("persistent_server requires parallel_gpus and parallel_by_rollout")
+        if int(config["hardware"].get("workers_per_gpu", 1)) != 1:
+            errors.append("persistent_server requires workers_per_gpu=1 to isolate RESET sessions")
+        if len(set(parallel_gpus)) != len(parallel_gpus):
+            errors.append("persistent_server requires distinct parallel_gpus")
 
     if errors:
         raise ValueError("Invalid Experiment 1 configuration:\n- " + "\n- ".join(errors))
@@ -482,6 +489,13 @@ def run_parallel_methods(
     dry_run: bool,
     only_jobs: set[tuple[str, str, int, int | None]] | None = None,
 ) -> None:
+    if config["hardware"].get("persistent_server"):
+        run_persistent_methods(
+            config, run_root, tasks=tasks, methods=methods,
+            states_per_task=states_per_task, rollouts_per_state=rollouts_per_state,
+            max_action_steps=max_action_steps, dry_run=dry_run, only_jobs=only_jobs,
+        )
+        return
     gpus = [int(gpu) for gpu in config["hardware"]["parallel_gpus"]]
     workers_per_gpu = int(config["hardware"].get("workers_per_gpu", 2))
     semaphores = {gpu: threading.Semaphore(workers_per_gpu) for gpu in gpus}
@@ -595,26 +609,171 @@ def run_parallel_methods(
     if only_jobs is not None:
         return
     if split_rollouts and not dry_run:
-        for task in tasks:
-            for state_id in range(states_per_task):
-                for method in methods:
+        merge_rollout_results(run_root, tasks, methods, states_per_task, rollouts_per_state)
+
+
+def complete_rollout(path: Path, method: str, task: str, state_id: int, rollout_id: int) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        result = load_json(path)
+        return (
+            result.get("task") == task
+            and result.get("method") == method
+            and result.get("state_id") == state_id
+            and result.get("num_rollouts") == 1
+            and result.get("valid_rollouts") == 1
+            and result.get("infra_failures") == 0
+            and len(result.get("rollouts", [])) == 1
+            and result["rollouts"][0]["rollout_id"] == rollout_id
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def merge_rollout_results(
+    run_root: Path, tasks: list[str], methods: list[str], states_per_task: int, rollouts_per_state: int,
+) -> None:
+    identity_keys = ("task", "mode", "state_id", "accepted_seed", "instruction", "method", "checkpoint_dir", "manifest_hash")
+    for task in tasks:
+        for state_id in range(states_per_task):
+            for method in methods:
+                raw_dir = run_root / "openwam" / method / "raw" / task / f"state_{state_id:03d}"
+                paths = [raw_dir / f"rollout_{i:03d}" / "result.json" for i in range(rollouts_per_state)]
+                if not all(complete_rollout(path, method, task, state_id, i) for i, path in enumerate(paths)):
+                    raise ValueError(f"Missing or failed rollout fragment: {raw_dir}")
+                fragments = [load_json(path) for path in paths]
+                if any(any(item[key] != fragments[0][key] for key in identity_keys) for item in fragments[1:]):
+                    raise ValueError(f"Rollout fragments do not share a fixed state: {raw_dir}")
+                rollouts = [fragment["rollouts"][0] for fragment in fragments]
+                if len({item["policy_seed"] for item in rollouts}) != rollouts_per_state:
+                    raise ValueError(f"Duplicate policy seeds: {raw_dir}")
+                payload = {key: fragments[0][key] for key in identity_keys}
+                payload.update(
+                    num_rollouts=rollouts_per_state,
+                    successes=sum(bool(item["success"]) for item in rollouts),
+                    valid_rollouts=rollouts_per_state,
+                    infra_failures=0,
+                    rollouts=rollouts,
+                )
+                write_json(raw_dir / "result.json", payload)
+
+
+def run_persistent_methods(
+    config: dict[str, Any], run_root: Path, *, tasks: list[str], methods: list[str],
+    states_per_task: int, rollouts_per_state: int, max_action_steps: int | None,
+    dry_run: bool, only_jobs: set[tuple[str, str, int, int | None]] | None = None,
+) -> None:
+    """Keep one server per GPU and method; give it exclusive rollout sessions."""
+    gpus = [int(gpu) for gpu in config["hardware"]["parallel_gpus"]]
+    manifest_root = Path(config["paths"]["state_manifest_root"])
+    openwam_repo = Path(config["paths"]["openwam_repo"])
+    host = str(config["hardware"]["openwam_host"])
+    base_port = int(config["hardware"]["openwam_port"])
+    failures: list[tuple[str, str, int, int, str]] = []
+    # Phase by method so a GPU loads each checkpoint at most once per invocation.
+    for method in methods:
+        jobs = [
+            (task, state_id, rollout_id)
+            for task in tasks
+            for state_id in range(states_per_task)
+            for rollout_id in range(rollouts_per_state)
+            if only_jobs is None or (method, task, state_id, rollout_id) in only_jobs
+        ]
+        pending = [
+            (index, job) for index, job in enumerate(jobs)
+            if not complete_rollout(
+                run_root / "openwam" / method / "raw" / job[0]
+                / f"state_{job[1]:03d}" / f"rollout_{job[2]:03d}" / "result.json",
+                method, *job,
+            )
+        ]
+        print(f"[experiment1] {method}: pending rollouts {len(pending)}/{len(jobs)}", flush=True)
+        if not pending:
+            continue
+        assignments = {gpu: [] for gpu in gpus}
+        for index, job in pending:
+            assignments[gpus[index % len(gpus)]].append(job)
+
+        def gpu_worker(gpu: int, gpu_jobs: list[tuple[str, int, int]]) -> list[tuple[str, str, int, int, str]]:
+            worker_config = deepcopy(config)
+            port = choose_available_port(host, base_port, gpu)
+            worker_config["hardware"].update(
+                openwam_model_gpu=gpu, openwam_sim_gpu=gpu, openwam_port=port,
+            )
+            model = worker_config["models"]["openwam"][method]
+            worker_dir = run_root / "openwam" / method / "workers" / f"gpu_{gpu}"
+            worker_dir.mkdir(parents=True, exist_ok=True)
+            process = log = None
+            restarts = 0
+            worker_errors = []
+            started = time.monotonic()
+            try:
+                for task, state_id, rollout_id in gpu_jobs:
+                    if process is None or (process is not None and process.poll() is not None):
+                        if process is not None:
+                            stop_server(process, log)
+                            restarts += 1
+                        ready_start = time.monotonic()
+                        try:
+                            server_dir = worker_dir if restarts == 0 else worker_dir / f"restart_{restarts:03d}"
+                            process, log = start_server(
+                                worker_config, method, model, run_root, dry_run, server_dir=server_dir,
+                            )
+                            write_json(server_dir / "timing.json", {
+                                "gpu": gpu, "method": method, "ready_sec": round(time.monotonic() - ready_start, 3),
+                                "restart": restarts,
+                            })
+                        except Exception as exc:
+                            worker_errors.append((method, task, state_id, rollout_id, str(exc)))
+                            process = log = None
+                            continue
                     raw_dir = run_root / "openwam" / method / "raw" / task / f"state_{state_id:03d}"
-                    fragments = [load_json(raw_dir / f"rollout_{i:03d}" / "result.json") for i in range(rollouts_per_state)]
-                    identity_keys = ("task", "mode", "state_id", "accepted_seed", "instruction", "method", "checkpoint_dir", "manifest_hash")
-                    if any(any(item[key] != fragments[0][key] for key in identity_keys) for item in fragments[1:]):
-                        raise ValueError(f"Rollout fragments do not share a fixed state: {raw_dir}")
-                    rollouts = [fragment["rollouts"][0] for fragment in fragments]
-                    if [item["rollout_id"] for item in rollouts] != list(range(rollouts_per_state)):
-                        raise ValueError(f"Missing or duplicate rollout IDs: {raw_dir}")
-                    payload = {key: fragments[0][key] for key in identity_keys}
-                    payload.update(
-                        num_rollouts=rollouts_per_state,
-                        successes=sum(bool(item["success"]) for item in rollouts),
-                        valid_rollouts=sum(item["error"] is None for item in rollouts),
-                        infra_failures=sum(item["error"] is not None for item in rollouts),
-                        rollouts=rollouts,
+                    rollout_dir = raw_dir / f"rollout_{rollout_id:03d}"
+                    client_env = make_env(worker_config, sim_gpu=True)
+                    client_env["ROBOTWIN_RUNTIME_ROOT"] = str(rollout_dir / "runtime")
+                    command = probe_command(
+                        worker_config, operation="run_state_rollouts", task=task,
+                        result_file=rollout_dir / "result.json",
+                        progress_file=rollout_dir / "progress.json", method=method,
+                        checkpoint_dir=model["checkpoint_dir"],
+                        state_manifest=manifest_root / task / config["protocol"]["mode"] / "manifest.json",
+                        state_id=state_id, num_rollouts=1, rollout_id_start=rollout_id,
+                        max_action_steps=max_action_steps,
                     )
-                    write_json(raw_dir / "result.json", payload)
+                    job_start = time.monotonic()
+                    try:
+                        run_logged(command, cwd=openwam_repo, env=client_env,
+                                   log_path=rollout_dir / "driver.log", dry_run=dry_run, quiet=True)
+                        if not dry_run and not complete_rollout(
+                            rollout_dir / "result.json", method, task, state_id, rollout_id,
+                        ):
+                            raise RuntimeError("driver exited without a valid rollout result")
+                    except Exception as exc:
+                        worker_errors.append((method, task, state_id, rollout_id, str(exc)))
+                    finally:
+                        write_json(rollout_dir / "timing.json", {
+                            "gpu": gpu, "port": port, "driver_wall_sec": round(time.monotonic() - job_start, 3),
+                        })
+            finally:
+                stop_server(process, log)
+                write_json(worker_dir / "worker_timing.json", {
+                    "gpu": gpu, "method": method, "jobs": len(gpu_jobs), "restarts": restarts,
+                    "wall_sec": round(time.monotonic() - started, 3),
+                })
+            return worker_errors
+
+        with ThreadPoolExecutor(max_workers=len(gpus)) as executor:
+            futures = {executor.submit(gpu_worker, gpu, assigned): gpu
+                       for gpu, assigned in assignments.items() if assigned}
+            for future in as_completed(futures):
+                failures.extend(future.result())
+    if failures:
+        for failure in failures:
+            print(f"[experiment1] failed {failure}", flush=True)
+        raise RuntimeError(f"{len(failures)} rollout(s) failed; resume to retry only missing results")
+    if only_jobs is None and not dry_run:
+        merge_rollout_results(run_root, tasks, methods, states_per_task, rollouts_per_state)
 
 
 def wilson_interval(successes: int, n: int, z: float = 1.959963984540054) -> tuple[float, float]:
