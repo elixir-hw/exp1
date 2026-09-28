@@ -102,6 +102,28 @@ class PersistentSchedulerTest(unittest.TestCase):
             self.assertTrue((dual_root / "openwam/no_wm/workers/gpu_0_slot_1/timing.json").is_file())
             self.assertEqual(len(starts), 7)
 
+            config["hardware"].update(
+                persistent_servers_per_gpu=1,
+                persistent_clients_per_gpu=2,
+                shared_server_sessions=True,
+            )
+            shared_root = root / "shared_sessions"
+            with patch.object(experiment, "start_server", side_effect=start_server), \
+                 patch.object(experiment, "stop_server"), \
+                 patch.object(experiment, "run_logged", side_effect=run_logged), \
+                 patch.object(experiment, "make_env", return_value={}):
+                experiment.run_persistent_methods(
+                    config, shared_root, tasks=["place_fan"], methods=["wm"],
+                    states_per_task=1, rollouts_per_state=4,
+                    max_action_steps=None, dry_run=False,
+                )
+            self.assertEqual(len(starts), 8)
+            self.assertEqual(len(drivers), 17)
+            self.assertEqual(
+                experiment.load_json(shared_root / "openwam/wm/workers/gpu_0/worker_timing.json")
+                ["clients_per_gpu"], 2,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

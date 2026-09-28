@@ -62,6 +62,37 @@ ssh chw@10.11.141.54 'tail -f /home/chw/code/packages/wm-function/exp1/runs/dist
 各约 101 秒，顺序基线各约 45 秒，资源争用明显。正式配置因此保持
 `persistent_servers_per_gpu=1`；显存余量本身不能预测吞吐提升。
 
+## 共享模型并行会话
+
+`config.experiment1.distributed.shared_smoke.json` 开启 `shared_server_sessions`，
+每张卡仍只装载一份当前 checkpoint。OpenWAM 的每个 WebSocket 连接拥有独立的
+`WAMPolicy`、action buffer、RESET 和请求计数；模型权重与文本缓存由该卡的服务
+共享。`persistent_clients_per_gpu` 限制每卡同时运行的 RoboTwin driver 数量。
+共享会话仅支持同步 executor；推理请求在服务端串行执行，但多个仿真环境可并行
+完成物理步进和取观测。断线后的新连接必须重新 RESET，避免悄悄继承其他轨迹状态。
+
+本机 GPU 0 的 Fan/WM 两轨迹全程对照：单常驻服务串行约 286 秒，同卡两个
+常驻服务约 282 秒，单模型共享两个会话约 257 秒。旧版逐轨迹加载模型的同卡
+两 worker 约 380 秒，但其中一条跑满 400 步；这组旧版时间不可作为同等动作量
+的严格速度比。共享会话两条均无基础设施错误，在 146、151 步成功。
+
+16 步容量探测：同卡共享模型 4 条并发完成，峰值 39.6 GB；8 条完成，峰值
+58.4 GB；10、12 条在装载阶段触及约 75 GB 的保护线，被主动停止。容量
+探测的截断轨迹只用于资源检查，不进入成功率统计。当前建议最多按 8 条并发
+做进一步完整轨迹验证，不把 10 或 12 设为默认。
+
+共享会话双机四任务 smoke：
+
+```bash
+python run_experiment1_distributed.py launch \
+  --config config.experiment1.distributed.shared_smoke.json \
+  --run-id four_task_shared_smoke_20260928_1000
+```
+
+每任务 1 state、每模型每 state 8 条完整 rollout，共 64 条；本机使用 GPU 0–3，
+141 使用 GPU 0–2。按分片计算，本机每卡最多 5 条并发、141 每卡最多 4 条。
+最终以 `coordinator_status.json`、64 条唯一结果及零错误作为验收条件。
+
 正式启动前，应先完成 20 state manifest 的构建和配对检查。正式配置使用独立的
 `manifests/experiment1_distributed_4_20_states`，避免覆盖早期单 state 记录。
 smoke 验收完成前不启动正式 5,120 条评测。

@@ -201,6 +201,14 @@ def launch(args: argparse.Namespace) -> None:
     checked(["rsync", "-a", "--no-owner", "--no-group", "--exclude=.git/", "--exclude=runs/",
              "--exclude=manifests/", "--exclude=__pycache__/", str(ROOT) + "/",
              f"{args.remote_host}:{args.remote_root}/"])
+    if config["hardware"].get("shared_server_sessions", False):
+        local_server = Path(config["paths"]["openwam_repo"]) / "openwam/deploy/server.py"
+        remote_server = local_server  # Both hosts use the same OpenWAM checkout path.
+        checked(["rsync", "-a", str(local_server), f"{args.remote_host}:{remote_server}"])
+        expected = hashlib.sha256(local_server.read_bytes()).hexdigest()
+        actual = remote_command(args.remote_host, ["sha256sum", str(remote_server)]).stdout.split()[0]
+        if actual != expected:
+            raise ValueError("Remote OpenWAM session server differs from local code")
     remote_manifest_root = args.remote_root / "manifests" / manifest_root.name
     checked(["ssh", "-o", "BatchMode=yes", args.remote_host,
              shlex.join(["mkdir", "-p", str(remote_manifest_root), str(remote_run_dir)])])

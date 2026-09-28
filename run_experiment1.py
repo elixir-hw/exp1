@@ -132,6 +132,13 @@ def validate(config: dict[str, Any]) -> None:
             errors.append("persistent_server requires distinct parallel_gpus")
         if int(config["hardware"].get("persistent_servers_per_gpu", 1)) < 1:
             errors.append("persistent_servers_per_gpu must be positive")
+        clients = int(config["hardware"].get("persistent_clients_per_gpu", 1))
+        if clients < 1:
+            errors.append("persistent_clients_per_gpu must be positive")
+        if clients > 1 and not config["hardware"].get("shared_server_sessions", False):
+            errors.append("multiple persistent clients require shared_server_sessions=true")
+        if clients > 1 and int(config["hardware"].get("persistent_servers_per_gpu", 1)) != 1:
+            errors.append("shared clients require one persistent model server per GPU")
 
     if errors:
         raise ValueError("Invalid Experiment 1 configuration:\n- " + "\n- ".join(errors))
@@ -365,6 +372,8 @@ def start_server(
         str(config["hardware"]["openwam_port"]),
         *model.get("deploy_args", []),
     ]
+    if config["hardware"].get("shared_server_sessions", False):
+        command.append("--session-isolation")
     if dry_run:
         log_path.write_text(" ".join(command) + "\n", encoding="utf-8")
         return None, None
@@ -669,6 +678,7 @@ def run_persistent_methods(
     """Keep one server per GPU and method; give it exclusive rollout sessions."""
     gpus = [int(gpu) for gpu in config["hardware"]["parallel_gpus"]]
     servers_per_gpu = int(config["hardware"].get("persistent_servers_per_gpu", 1))
+    clients_per_gpu = int(config["hardware"].get("persistent_clients_per_gpu", 1))
     slots = [(gpu, slot) for gpu in gpus for slot in range(servers_per_gpu)]
     manifest_root = Path(config["paths"]["state_manifest_root"])
     openwam_repo = Path(config["paths"]["openwam_repo"])
@@ -713,8 +723,39 @@ def run_persistent_methods(
             restarts = 0
             worker_errors = []
             started = time.monotonic()
+
+            def run_rollout(task: str, state_id: int, rollout_id: int) -> tuple[str, str, int, int, str] | None:
+                raw_dir = run_root / "openwam" / method / "raw" / task / f"state_{state_id:03d}"
+                rollout_dir = raw_dir / f"rollout_{rollout_id:03d}"
+                client_env = make_env(worker_config, sim_gpu=True)
+                client_env["ROBOTWIN_RUNTIME_ROOT"] = str(rollout_dir / "runtime")
+                command = probe_command(
+                    worker_config, operation="run_state_rollouts", task=task,
+                    result_file=rollout_dir / "result.json",
+                    progress_file=rollout_dir / "progress.json", method=method,
+                    checkpoint_dir=model["checkpoint_dir"],
+                    state_manifest=manifest_root / task / config["protocol"]["mode"] / "manifest.json",
+                    state_id=state_id, num_rollouts=1, rollout_id_start=rollout_id,
+                    max_action_steps=max_action_steps,
+                )
+                job_start = time.monotonic()
+                try:
+                    run_logged(command, cwd=openwam_repo, env=client_env,
+                               log_path=rollout_dir / "driver.log", dry_run=dry_run, quiet=True)
+                    if not dry_run and not complete_rollout(
+                        rollout_dir / "result.json", method, task, state_id, rollout_id,
+                    ):
+                        raise RuntimeError("driver exited without a valid rollout result")
+                    return None
+                except Exception as exc:
+                    return (method, task, state_id, rollout_id, str(exc))
+                finally:
+                    write_json(rollout_dir / "timing.json", {
+                        "gpu": gpu, "port": port, "driver_wall_sec": round(time.monotonic() - job_start, 3),
+                    })
+
             try:
-                for task, state_id, rollout_id in gpu_jobs:
+                for job_index, (task, state_id, rollout_id) in enumerate(gpu_jobs):
                     if process is None or (process is not None and process.poll() is not None):
                         if process is not None:
                             stop_server(process, log)
@@ -734,38 +775,27 @@ def run_persistent_methods(
                             worker_errors.append((method, task, state_id, rollout_id, str(exc)))
                             process = log = None
                             continue
-                    raw_dir = run_root / "openwam" / method / "raw" / task / f"state_{state_id:03d}"
-                    rollout_dir = raw_dir / f"rollout_{rollout_id:03d}"
-                    client_env = make_env(worker_config, sim_gpu=True)
-                    client_env["ROBOTWIN_RUNTIME_ROOT"] = str(rollout_dir / "runtime")
-                    command = probe_command(
-                        worker_config, operation="run_state_rollouts", task=task,
-                        result_file=rollout_dir / "result.json",
-                        progress_file=rollout_dir / "progress.json", method=method,
-                        checkpoint_dir=model["checkpoint_dir"],
-                        state_manifest=manifest_root / task / config["protocol"]["mode"] / "manifest.json",
-                        state_id=state_id, num_rollouts=1, rollout_id_start=rollout_id,
-                        max_action_steps=max_action_steps,
-                    )
-                    job_start = time.monotonic()
-                    try:
-                        run_logged(command, cwd=openwam_repo, env=client_env,
-                                   log_path=rollout_dir / "driver.log", dry_run=dry_run, quiet=True)
-                        if not dry_run and not complete_rollout(
-                            rollout_dir / "result.json", method, task, state_id, rollout_id,
-                        ):
-                            raise RuntimeError("driver exited without a valid rollout result")
-                    except Exception as exc:
-                        worker_errors.append((method, task, state_id, rollout_id, str(exc)))
-                    finally:
-                        write_json(rollout_dir / "timing.json", {
-                            "gpu": gpu, "port": port, "driver_wall_sec": round(time.monotonic() - job_start, 3),
-                        })
+                    if clients_per_gpu == 1:
+                        failure = run_rollout(task, state_id, rollout_id)
+                        if failure:
+                            worker_errors.append(failure)
+                    else:
+                        # The model is loaded once. Each driver opens its own WebSocket,
+                        # whose action buffer and RESET state live in a separate session.
+                        remaining = gpu_jobs[job_index:]
+                        with ThreadPoolExecutor(max_workers=clients_per_gpu) as clients:
+                            futures = {clients.submit(run_rollout, *job): job for job in remaining}
+                            for future in as_completed(futures):
+                                failure = future.result()
+                                if failure:
+                                    worker_errors.append(failure)
+                        break
             finally:
                 stop_server(process, log)
                 write_json(worker_dir / "worker_timing.json", {
                     "gpu": gpu, "slot": slot, "method": method,
-                    "jobs": len(gpu_jobs), "restarts": restarts,
+                    "jobs": len(gpu_jobs), "clients_per_gpu": clients_per_gpu,
+                    "restarts": restarts,
                     "wall_sec": round(time.monotonic() - started, 3),
                 })
             return worker_errors
@@ -1053,6 +1083,7 @@ def main() -> None:
     parser.add_argument("--skip-text-cache", action="store_true")
     parser.add_argument("--parallel-gpus", help="Comma-separated GPU indices for this host")
     parser.add_argument("--persistent-servers-per-gpu", type=int)
+    parser.add_argument("--persistent-clients-per-gpu", type=int)
     parser.add_argument("--force-manifests", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -1074,6 +1105,8 @@ def main() -> None:
             parser.error("--parallel-gpus must be comma-separated integers")
     if args.persistent_servers_per_gpu is not None:
         config["hardware"]["persistent_servers_per_gpu"] = args.persistent_servers_per_gpu
+    if args.persistent_clients_per_gpu is not None:
+        config["hardware"]["persistent_clients_per_gpu"] = args.persistent_clients_per_gpu
     validate(config)
     print("[experiment1] configuration is valid")
     if args.command == "validate":
