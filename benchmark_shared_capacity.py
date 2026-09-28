@@ -50,8 +50,10 @@ def main() -> None:
             "--config", str(config_path.resolve()), "--run-dir", str(run_dir.resolve()),
             "--method", "wm", "--task-limit", "1", "--state-limit", "1",
             "--rollouts-per-state", str(count), "--parallel-gpus", str(args.gpu),
-            "--max-action-steps", str(args.max_action_steps), "--skip-text-cache",
+            "--skip-text-cache",
         ]
+        if args.max_action_steps > 0:
+            command.extend(["--max-action-steps", str(args.max_action_steps)])
         started = time.monotonic()
         peak_mib = 0
         timed_out = False
@@ -72,7 +74,9 @@ def main() -> None:
                     break
                 time.sleep(1)
         rows = []
-        summary = run_dir / "summary/smoke_rollouts.csv"
+        summary = run_dir / "summary" / (
+            "smoke_rollouts.csv" if args.max_action_steps > 0 else "per_rollout.csv"
+        )
         if summary.is_file():
             with summary.open() as stream:
                 rows = list(csv.DictReader(stream))

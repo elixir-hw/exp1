@@ -42,7 +42,9 @@
     "parallel_by_rollout": true,
     "openwam_host": "127.0.0.1",
     "openwam_port": 8848,
-    "persistent_server": true
+    "persistent_server": true,
+    "shared_server_sessions": true,
+    "persistent_clients_per_gpu": 8
   },
   "models": {
     "openwam": {
