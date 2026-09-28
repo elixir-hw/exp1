@@ -86,11 +86,15 @@ def load_tasks(path: Path) -> list[str]:
 
 
 def run_logged(
-    command: list[str], *, cwd: Path, env: dict[str, str], log_path: Path, dry_run: bool
+    command: list[str], *, cwd: Path, env: dict[str, str], log_path: Path, dry_run: bool,
+    quiet: bool = False,
 ) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     rendered = " ".join(command)
-    print(f"[wm-eval] cwd={cwd}\n[wm-eval] command={rendered}", flush=True)
+    if quiet:
+        print(f"[wm-eval] running: {log_path}", flush=True)
+    else:
+        print(f"[wm-eval] cwd={cwd}\n[wm-eval] command={rendered}", flush=True)
     if dry_run:
         log_path.write_text(rendered + "\n", encoding="utf-8")
         return
@@ -106,12 +110,15 @@ def run_logged(
         )
         assert process.stdout is not None
         for line in process.stdout:
-            sys.stdout.write(line)
+            if not quiet:
+                sys.stdout.write(line)
             log.write(line)
             log.flush()
         return_code = process.wait()
     if return_code != 0:
         raise RuntimeError(f"Command failed with exit code {return_code}; see {log_path}")
+    if quiet:
+        print(f"[wm-eval] done: {log_path}", flush=True)
 
 
 def python_command(config: dict[str, Any], family: str) -> list[str]:
@@ -124,4 +131,3 @@ def python_command(config: dict[str, Any], family: str) -> list[str]:
     env_name = runtime.get("conda_env", family)
     conda = runtime.get("conda_executable", "conda")
     return [str(conda), "run", "--no-capture-output", "-n", str(env_name), "python"]
-

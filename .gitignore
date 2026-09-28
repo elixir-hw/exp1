@@ -5,6 +5,8 @@ __pycache__/
 
 config.formal.json
 config.smoke.json
+config.experiment1.json
+config.experiment1.smoke.json
 manifests/
 runs/
 

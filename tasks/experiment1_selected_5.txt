@@ -1,0 +1,6 @@
+# User-selected seen tasks for the four-GPU comparison.
+place_fan
+place_a2b_right
+put_bottles_dustbin
+place_mouse_pad
+place_dual_shoes

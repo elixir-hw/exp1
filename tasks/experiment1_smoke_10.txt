@@ -1,0 +1,12 @@
+# Temporary smoke-test task list for Experiment 1.
+# Replace with the final representative 10 tasks when selected.
+beat_block_hammer
+blocks_ranking_rgb
+blocks_ranking_size
+click_alarmclock
+click_bell
+dump_bin_bigbin
+handover_mic
+hanging_mug
+lift_pot
+move_playingcard_away
