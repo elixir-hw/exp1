@@ -1,0 +1,90 @@
+diff --git a/OpenWAM/benchmarks/robotwin/openwam2robotwin_interface.py b/OpenWAM/benchmarks/robotwin/openwam2robotwin_interface.py
+index a008dd7f..4e09cbac 100644
+--- a/OpenWAM/benchmarks/robotwin/openwam2robotwin_interface.py
++++ b/OpenWAM/benchmarks/robotwin/openwam2robotwin_interface.py
+@@ -209,6 +209,7 @@ class ModelClient:
+         self._debug_dir = debug_dir
+         self._episode = -1  # incremented to 0 on the first reset_model() call
+         self._step = 0
++        self._sampling_seed: Optional[int] = None
+ 
+         self._ws_url = f"ws://{host}:{port}"
+         self._client = WSPolicyClient(self._ws_url, timeout=request_timeout)
+@@ -258,6 +259,10 @@ class ModelClient:
+         if result.get("type") != transport.RESET_ACK:
+             raise RuntimeError(f"[OpenWAMClient] Server reset failed: {result}")
+ 
++    def set_sampling_seed(self, seed: int) -> None:
++        self._sampling_seed = int(seed)
++        self._step = 0
++
+     def _save_debug_step(
+         self,
+         cams: dict,
+@@ -348,6 +353,8 @@ class ModelClient:
+             prompt=prompt,
+             state=state_list,
+         )
++        if self._sampling_seed is not None:
++            payload["seed"] = self._sampling_seed * 10000 + self._step
+         response = self._client.predict(payload)
+         action = np.array(response["action"], dtype=np.float32)
+ 
+diff --git a/OpenWAM/openwam/deploy/policy.py b/OpenWAM/openwam/deploy/policy.py
+index 134ca46b..48ccb7cd 100644
+--- a/OpenWAM/openwam/deploy/policy.py
++++ b/OpenWAM/openwam/deploy/policy.py
+@@ -99,4 +99,6 @@ class WAMPolicy:
+             conditions["prompt"] = obs["prompt"]
+         if "state" in obs and obs["state"] is not None:
+             conditions["proprio"] = obs["state"]
++        if "seed" in obs and obs["seed"] is not None:
++            conditions["seed"] = int(obs["seed"])
+         return conditions
+diff --git a/OpenWAM/openwam/model/video_backbone/wan_backbone.py b/OpenWAM/openwam/model/video_backbone/wan_backbone.py
+index 1c6e5d47..f73d007d 100644
+--- a/OpenWAM/openwam/model/video_backbone/wan_backbone.py
++++ b/OpenWAM/openwam/model/video_backbone/wan_backbone.py
+@@ -936,14 +936,34 @@ class WanBase(VideoBackbone):
+             time_division_remainder=self._time_division_remainder,
+         )
+ 
+-        context, seq_lens = wan_encode.encode_text_for_inference(
+-            prompt,
+-            vace_cache=vace_cache,
+-            prompt_embed_cache=prompt_embed_cache,
+-            tokenizer=self._tokenizer,
+-            text_encoder=self.text_encoder,
+-            device=self.device,
+-        )
++        if self._text_embedding_cache is not None:
++            context, seq_lens = self._text_embedding_cache.load_batch(
++                [prompt], device=self.device, dtype=self.dtype
++            )
++            if prompt_embed_cache is not None:
++                prompt_embed_cache[prompt] = (context, seq_lens)
++            if not self._logged_cached_text_embeddings:
++                logger.info(
++                    "Using cached text embeddings for inference; skipping Wan T5 encode: %s",
++                    self._text_embedding_cache.cache_dir,
++                )
++                self._logged_cached_text_embeddings = True
++        else:
++            text_encoder = getattr(self, "text_encoder", None)
++            if text_encoder is None:
++                raise RuntimeError(
++                    "Wan text_encoder is not loaded and no text embedding cache is configured. "
++                    "Set training.use_cached_text_embeddings=true with training.text_embedding_cache_dir, "
++                    "or set model.video_backbone.load_text_encoder=true."
++                )
++            context, seq_lens = wan_encode.encode_text_for_inference(
++                prompt,
++                vace_cache=vace_cache,
++                prompt_embed_cache=prompt_embed_cache,
++                tokenizer=self._tokenizer,
++                text_encoder=text_encoder,
++                device=self.device,
++            )
+ 
+         _DEFAULT_CAMERA_ORIGIN = (
+             0,
